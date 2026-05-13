@@ -353,6 +353,18 @@ export const goBack = () => {
     const endDate = DateTime.fromISO(time.endDate);
 
     const daysBetweenStartAndEnd = endDate.diff(startDate, "days").days;
+    if (daysBetweenStartAndEnd === 0) {
+      const previousDate = startDate.minus({ days: 1 }).toISODate() ?? "";
+      setTime(
+        {
+          mode: "range",
+          startDate: previousDate,
+          endDate: previousDate,
+        },
+        false
+      );
+      return;
+    }
 
     setTime(
       {
@@ -418,6 +430,24 @@ export const goForward = () => {
     const now = DateTime.now();
 
     const daysBetweenStartAndEnd = endDate.diff(startDate, "days").days;
+    if (daysBetweenStartAndEnd === 0) {
+      const proposedDate = startDate.plus({ days: 1 });
+      if (proposedDate > now) {
+        return;
+      }
+
+      const nextDate = proposedDate.toISODate() ?? "";
+      setTime(
+        {
+          mode: "range",
+          startDate: nextDate,
+          endDate: nextDate,
+        },
+        false
+      );
+      return;
+    }
+
     const proposedEndDate = endDate.plus({ days: daysBetweenStartAndEnd });
 
     // Don't allow moving forward if it would put the entire range in the future

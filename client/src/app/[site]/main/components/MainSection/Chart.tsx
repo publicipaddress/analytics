@@ -96,6 +96,24 @@ const canDragSelectBucket = (bucket: TimeBucket) =>
   bucket === "hour" ||
   bucket === "day";
 
+const getDragZoomBucket = (
+  start: DateTime,
+  endExclusive: DateTime,
+  sourceBucket: TimeBucket
+): TimeBucket | null => {
+  if (sourceBucket === "day") {
+    const days = Math.round(
+      endExclusive.startOf("day").diff(start.startOf("day"), "days").days
+    );
+    return days <= 3 ? "hour" : null;
+  }
+
+  const minutes = endExclusive.diff(start, "minutes").minutes;
+  if (minutes <= 60) return "minute";
+  if (minutes <= 3 * 24 * 60) return "hour";
+  return null;
+};
+
 type Point = {
   x: Date;
   y: number;
@@ -198,7 +216,7 @@ export function Chart({
   max: number;
   chartXMax: Date | undefined;
 }) {
-  const { time, bucket, selectedStat, previousTime, setTime } = useStore();
+  const { time, bucket, selectedStat, previousTime, setTime, setBucket } = useStore();
   const { resolvedTheme } = useTheme();
   const isDark = resolvedTheme === "dark";
   const timezone = getTimezone();
@@ -494,17 +512,31 @@ export function Chart({
   } | null>(null);
   const dragZoomRestoreRef = useRef<{
     before: Time;
+    beforeBucket: TimeBucket;
     after: Time;
-    bucket: TimeBucket;
+    afterBucket: TimeBucket;
   } | null>(null);
 
   useEffect(() => {
     const dragZoom = dragZoomRestoreRef.current;
     if (!dragZoom) return;
-    if (!isSameTime(time, dragZoom.after) || bucket !== dragZoom.bucket) {
+    if (!isSameTime(time, dragZoom.after) || bucket !== dragZoom.afterBucket) {
       dragZoomRestoreRef.current = null;
     }
   }, [bucket, time]);
+
+  const commitDragZoom = (nextTime: Time, nextBucket: TimeBucket) => {
+    dragZoomRestoreRef.current = {
+      before: time,
+      beforeBucket: bucket,
+      after: nextTime,
+      afterBucket: nextBucket,
+    };
+    setTime(nextTime, false);
+    if (nextBucket !== bucket) {
+      setBucket(nextBucket);
+    }
+  };
 
   // Snap drag positions the same way hover does: to the nearest visible
   // current bucket, so the committed selection matches the crosshair.
@@ -577,10 +609,12 @@ export function Chart({
         const endDate = endBucket.toISODate();
         if (!startDate || !endDate) return;
         const nextTime: Time = { mode: "range", startDate, endDate };
-        dragZoomRestoreRef.current = { before: time, after: nextTime, bucket };
+        const nextBucket =
+          getDragZoomBucket(startBucket, stepBucket(endBucket, bucket, 1), bucket) ??
+          bucket;
         // Pass changeBucket=false so dragging within e.g. an all-time/day
         // view doesn't auto-switch to week/month for shorter ranges.
-        setTime(nextTime, false);
+        commitDragZoom(nextTime, nextBucket);
         return;
       }
 
@@ -595,8 +629,9 @@ export function Chart({
           startTime: startBucket.toFormat("HH:mm:ss"),
           endTime: endExclusive.toFormat("HH:mm:ss"),
         };
-        dragZoomRestoreRef.current = { before: time, after: nextTime, bucket };
-        setTime(nextTime, false);
+        const nextBucket =
+          getDragZoomBucket(startBucket, endExclusive, bucket) ?? bucket;
+        commitDragZoom(nextTime, nextBucket);
       }
     };
 
@@ -607,12 +642,15 @@ export function Chart({
   const handleDoubleClick = (e: React.MouseEvent<SVGRectElement>) => {
     const dragZoom = dragZoomRestoreRef.current;
     if (!dragZoom) return;
-    if (!isSameTime(time, dragZoom.after) || bucket !== dragZoom.bucket) return;
+    if (!isSameTime(time, dragZoom.after) || bucket !== dragZoom.afterBucket) return;
 
     e.preventDefault();
     setHover(null);
     dragZoomRestoreRef.current = null;
     setTime(dragZoom.before, false);
+    if (dragZoom.beforeBucket !== bucket) {
+      setBucket(dragZoom.beforeBucket);
+    }
   };
 
   const tooltipWidth = 220;
