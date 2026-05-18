@@ -10,6 +10,7 @@ import { apiKey } from "@better-auth/api-key"
 import { db } from "../db/postgres/postgres.js";
 import * as schema from "../db/postgres/schema.js";
 import { invitation, member, memberSiteAccess, user } from "../db/postgres/schema.js";
+import { invalidateSitesAccessCache } from "./auth-utils.js";
 import { API_RATE_LIMIT_WINDOW, DISABLE_SIGNUP, IS_CLOUD, STANDARD_API_RATE_LIMIT } from "./const.js";
 import {
   addContactToAudience,
@@ -42,6 +43,20 @@ const pluginList = [
     creatorRole: "owner",
     teams: {
       enabled: true,
+    },
+    organizationHooks: {
+      afterRemoveMember: async ({ member: removedMember, user: removedUser, organization: org }) => {
+        // Clear any pending/accepted invitations for this user+org so a stale
+        // invite can't be re-accepted and recreate access after removal.
+        try {
+          await db
+            .delete(invitation)
+            .where(and(eq(invitation.email, removedUser.email), eq(invitation.organizationId, org.id)));
+        } catch (error) {
+          console.error("Error deleting invitations for removed member:", error);
+        }
+        invalidateSitesAccessCache(removedMember.userId);
+      },
     },
     sendInvitationEmail: async invitationData => {
       const inviteLink = `${process.env.BASE_URL}/invitation?invitationId=${invitationData.invitation.id}&organization=${invitationData.organization.name}&inviterEmail=${invitationData.inviter.user.email}`;
@@ -256,62 +271,82 @@ export const auth = betterAuth({
     after: createAuthMiddleware(async ctx => {
       // Handle invitation acceptance - copy site access from invitation to member
       if (ctx.path === "/organization/accept-invitation") {
+        const body = ctx.body as { invitationId?: string } | null;
+        const invitationId = body?.invitationId;
+        if (!invitationId) return;
+
         try {
-          const body = ctx.body as { invitationId?: string } | null;
-          const invitationId = body?.invitationId;
+          const invitationRecord = await db
+            .select({
+              organizationId: invitation.organizationId,
+              email: invitation.email,
+              hasRestrictedSiteAccess: invitation.hasRestrictedSiteAccess,
+              siteIds: invitation.siteIds,
+            })
+            .from(invitation)
+            .where(eq(invitation.id, invitationId))
+            .limit(1);
 
-          if (invitationId) {
-            // Query the invitation to get site access settings and org/email info
-            const invitationRecord = await db
-              .select({
-                organizationId: invitation.organizationId,
-                email: invitation.email,
-                hasRestrictedSiteAccess: invitation.hasRestrictedSiteAccess,
-                siteIds: invitation.siteIds,
-              })
-              .from(invitation)
-              .where(eq(invitation.id, invitationId))
-              .limit(1);
+          if (invitationRecord.length === 0) return;
+          const { organizationId, email, hasRestrictedSiteAccess, siteIds } = invitationRecord[0];
+          if (!hasRestrictedSiteAccess) return;
 
-            if (invitationRecord.length > 0) {
-              const { organizationId, email, hasRestrictedSiteAccess, siteIds } = invitationRecord[0];
-              const userRecord = await db.select({ id: user.id }).from(user).where(eq(user.email, email)).limit(1);
+          const userRecord = await db.select({ id: user.id }).from(user).where(eq(user.email, email)).limit(1);
+          if (userRecord.length === 0) return;
 
-              if (userRecord.length > 0) {
-                const userId = userRecord[0].id;
+          const memberRecord = await db
+            .select({ id: member.id })
+            .from(member)
+            .where(and(eq(member.organizationId, organizationId), eq(member.userId, userRecord[0].id)))
+            .limit(1);
+          if (memberRecord.length === 0) return;
+          const memberId = memberRecord[0].id;
 
-                await db.transaction(async tx => {
-                  // Find the member by organizationId + userId
-                  const memberRecord = await tx
-                    .select({ id: member.id })
-                    .from(member)
-                    .where(and(eq(member.organizationId, organizationId), eq(member.userId, userId)))
-                    .limit(1);
+          // Fail-safe ordering: flip the member to restricted BEFORE inserting the
+          // granted-site rows. If the insert step then fails, the member is left
+          // with hasRestrictedSiteAccess=true and zero rows in memberSiteAccess —
+          // i.e. locked out, which is safe. The previous transaction-based
+          // implementation would silently leave the member unrestricted (full
+          // org access) on any failure.
+          await db.update(member).set({ hasRestrictedSiteAccess: true }).where(eq(member.id, memberId));
 
-                  if (memberRecord.length > 0) {
-                    const memberId = memberRecord[0].id;
+          const siteIdArray = (siteIds || []) as number[];
+          if (siteIdArray.length > 0) {
+            await db.insert(memberSiteAccess).values(
+              siteIdArray.map(siteId => ({
+                memberId,
+                siteId,
+              }))
+            );
+          }
 
-                    // Copy site access restrictions
-                    if (hasRestrictedSiteAccess) {
-                      await tx.update(member).set({ hasRestrictedSiteAccess: true }).where(eq(member.id, memberId));
+          invalidateSitesAccessCache(userRecord[0].id);
+        } catch (error) {
+          console.error("Error applying invitation site restrictions:", error);
+        }
+      }
 
-                      const siteIdArray = (siteIds || []) as number[];
-                      if (siteIdArray.length > 0) {
-                        await tx.insert(memberSiteAccess).values(
-                          siteIdArray.map(siteId => ({
-                            memberId: memberId,
-                            siteId: siteId,
-                          }))
-                        );
-                      }
-                    }
-                  }
-                });
-              }
+      // Handle self-removal via /organization/leave. Better-auth does NOT call
+      // organizationHooks.afterRemoveMember for this path, so the cleanup
+      // (invitation purge + access-cache invalidation) has to live here.
+      if (ctx.path === "/organization/leave") {
+        try {
+          const session = (ctx.context as any).session;
+          const userId = session?.user?.id;
+          const userEmail = session?.user?.email;
+          const body = ctx.body as { organizationId?: string } | null;
+          const organizationId = body?.organizationId;
+
+          if (userId && organizationId) {
+            if (userEmail) {
+              await db
+                .delete(invitation)
+                .where(and(eq(invitation.email, userEmail), eq(invitation.organizationId, organizationId)));
             }
+            invalidateSitesAccessCache(userId);
           }
         } catch (error) {
-          console.error("Error copying site access from invitation to member:", error);
+          console.error("Error cleaning up after organization leave:", error);
         }
       }
     }),
