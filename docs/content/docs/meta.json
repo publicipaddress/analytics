@@ -18,6 +18,7 @@
     "api",
     "hiding-own-traffic",
     "filter-traffic",
+    "bot-detection",
     "goals",
     "funnels",
     "embeds",
