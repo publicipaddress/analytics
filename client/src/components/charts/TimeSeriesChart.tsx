@@ -30,9 +30,28 @@ export type TimeSeriesChartPoint = {
   y: number;
 };
 
+export type TimeSeriesChartSeries<Point extends TimeSeriesChartPoint = TimeSeriesChartPoint> = {
+  id: string;
+  data: Point[];
+  color: string;
+  strokeWidth?: number;
+};
+
+export type TimeSeriesChartMarker = {
+  value: number;
+  color: string;
+  label?: string;
+  strokeDasharray?: string;
+};
+
 type TimeSeriesTooltipContext<CurrentPoint extends TimeSeriesChartPoint, PreviousPoint extends TimeSeriesChartPoint> = {
   point: CurrentPoint;
   previousPoint?: PreviousPoint;
+  points: Array<{
+    id: string;
+    color: string;
+    point: CurrentPoint;
+  }>;
   bucket: TimeBucket;
 };
 
@@ -45,6 +64,8 @@ type TimeSeriesChartProps<
   max: number;
   chartMin: Date | undefined;
   chartMax: Date | undefined;
+  series?: TimeSeriesChartSeries<CurrentPoint>[];
+  markers?: TimeSeriesChartMarker[];
   displayDashed?: boolean;
   currentColor?: string;
   currentAreaOpacity?: number;
@@ -159,6 +180,8 @@ export function TimeSeriesChart<
   max,
   chartMin,
   chartMax,
+  series,
+  markers = [],
   displayDashed = false,
   currentColor = "hsl(var(--dataviz))",
   currentAreaOpacity = 0.3,
@@ -222,6 +245,17 @@ export function TimeSeriesChart<
   const plotBottom = H - MARGIN.bottom;
   const plotW = Math.max(0, plotRight - plotLeft);
   const plotH = Math.max(0, plotBottom - plotTop);
+  const primarySeries = series?.find(item => item.data.length > 0);
+  const primaryData = current.length ? current : (primarySeries?.data ?? []);
+  const hoverSeries = series?.length
+    ? series
+    : [
+        {
+          id: "Current",
+          data: current,
+          color: currentColor,
+        },
+      ];
 
   const xScale = useMemo(() => {
     if (!W || !chartMin || !chartMax) {
@@ -296,7 +330,7 @@ export function TimeSeriesChart<
       return reduceTicksForUniqueLabels(ticks, xTickCount, formatTickLabel);
     }
 
-    const anchorMs = current.length ? current[0].x.getTime() : chartMinMs;
+    const anchorMs = primaryData.length ? primaryData[0].x.getTime() : chartMinMs;
     const anchor = DateTime.fromMillis(anchorMs, { zone: "utc" }).setZone(timezone);
 
     const ticks: Date[] = [];
@@ -324,7 +358,7 @@ export function TimeSeriesChart<
     chartMax,
     xTickCount,
     minuteTickInterval,
-    current,
+    primaryData,
     bucket,
     timezone,
     time.mode,
@@ -340,9 +374,12 @@ export function TimeSeriesChart<
 
   const yTicks = useMemo(() => yScale.ticks(Y_TICKS), [yScale]);
 
+  const usesCustomSeries = Boolean(series);
   const croppedCurrent = displayDashed ? current.slice(0, -1) : current;
   const dashedSegment =
-    displayDashed && current.length >= 2 ? [current[current.length - 2], current[current.length - 1]] : null;
+    !usesCustomSeries && displayDashed && current.length >= 2
+      ? [current[current.length - 2], current[current.length - 1]]
+      : null;
 
   const lineGen = useMemo(
     () =>
@@ -363,11 +400,18 @@ export function TimeSeriesChart<
     [xScale, yScale]
   );
 
-  const currentLinePath = croppedCurrent.length ? (lineGen(croppedCurrent) ?? "") : "";
-  const currentAreaPath = croppedCurrent.length ? (areaGen(croppedCurrent) ?? "") : "";
+  const currentLinePath = !usesCustomSeries && croppedCurrent.length ? (lineGen(croppedCurrent) ?? "") : "";
+  const currentAreaPath = !usesCustomSeries && croppedCurrent.length ? (areaGen(croppedCurrent) ?? "") : "";
   const dashedLinePath = dashedSegment && dashedSegment.length === 2 ? (lineGen(dashedSegment) ?? "") : "";
   const dashedAreaPath = dashedSegment && dashedSegment.length === 2 ? (areaGen(dashedSegment) ?? "") : "";
   const previousLinePath = previous.length ? (lineGen(previous) ?? "") : "";
+  const seriesLinePaths =
+    series
+      ?.map(item => ({
+        ...item,
+        path: item.data.length ? (lineGen(item.data) ?? "") : "",
+      }))
+      .filter(item => item.path) ?? [];
 
   const tickColor = isDark ? "hsl(var(--neutral-400))" : "hsl(var(--neutral-500))";
   const gridColor = isDark ? "hsl(var(--neutral-800))" : "hsl(var(--neutral-100))";
@@ -379,26 +423,48 @@ export function TimeSeriesChart<
   const [hover, setHover] = useState<{
     point: CurrentPoint;
     previousPoint?: PreviousPoint;
+    points: Array<{
+      id: string;
+      color: string;
+      point: CurrentPoint;
+    }>;
     clientX: number;
     clientY: number;
   } | null>(null);
 
   const handleMouseMove = (e: React.MouseEvent<SVGRectElement>) => {
-    if (!current.length) return;
+    if (!primaryData.length) return;
     if (dragRaw) return;
     const rect = e.currentTarget.getBoundingClientRect();
     const x = e.clientX - rect.left + plotLeft;
     const xDate = xScale.invert(x);
-    const idx = bisectCurrent(current, xDate);
-    const point = current[idx];
+    const idx = bisectCurrent(primaryData, xDate);
+    const point = primaryData[idx];
     if (!point) return;
+
+    const points = hoverSeries.flatMap(item => {
+      if (!item.data.length) return [];
+      const seriesPoint = item.data[bisectCurrent(item.data, point.x)];
+      if (!seriesPoint || seriesPoint.x.getTime() !== point.x.getTime()) {
+        return [];
+      }
+      return seriesPoint
+        ? [
+            {
+              id: item.id,
+              color: item.color,
+              point: seriesPoint,
+            },
+          ]
+        : [];
+    });
 
     let previousPoint: PreviousPoint | undefined;
     if (previous.length) {
       const pIdx = bisectPrev(previous, point.x);
       previousPoint = previous[pIdx];
     }
-    setHover({ point, previousPoint, clientX: e.clientX, clientY: e.clientY });
+    setHover({ point, previousPoint, points, clientX: e.clientX, clientY: e.clientY });
   };
 
   const handleMouseLeave = () => setHover(null);
@@ -440,13 +506,13 @@ export function TimeSeriesChart<
   const pxToBucketStart = useCallback(
     (px: number) => {
       const xDate = xScale.invert(px);
-      const point = current[bisectCurrent(current, xDate)];
+      const point = primaryData[bisectCurrent(primaryData, xDate)];
       if (point) {
         return DateTime.fromJSDate(point.x, { zone: "utc" }).setZone(timezone);
       }
       return floorToBucket(DateTime.fromMillis(xDate.getTime(), { zone: "utc" }).setZone(timezone), bucket);
     },
-    [bisectCurrent, bucket, current, timezone, xScale]
+    [bisectCurrent, bucket, primaryData, timezone, xScale]
   );
 
   const dragSnapped = useMemo(() => {
@@ -462,7 +528,7 @@ export function TimeSeriesChart<
   }, [dragRaw, pxToBucketStart, xScale]);
 
   const handleMouseDown = (e: React.MouseEvent<SVGRectElement>) => {
-    if (!dragEnabled || !current.length) return;
+    if (!dragEnabled || !primaryData.length) return;
     e.preventDefault();
     const rect = e.currentTarget.getBoundingClientRect();
     const startX = Math.max(plotLeft, Math.min(plotRight, e.clientX - rect.left + plotLeft));
@@ -589,11 +655,44 @@ export function TimeSeriesChart<
             />
           ))}
 
+          {markers.map(marker => {
+            const y = yScale(marker.value);
+            if (y < plotTop || y > plotBottom) return null;
+            return (
+              <g key={`${marker.value}-${marker.label ?? marker.color}`} pointerEvents="none">
+                <line
+                  x1={plotLeft}
+                  x2={plotRight}
+                  y1={y}
+                  y2={y}
+                  stroke={marker.color}
+                  strokeWidth={1}
+                  strokeDasharray={marker.strokeDasharray ?? "8 8"}
+                />
+                {marker.label && (
+                  <text
+                    x={plotLeft + 6}
+                    y={Math.max(plotTop + 11, y - 6)}
+                    fill={marker.color}
+                    fontSize={11}
+                    textAnchor="start"
+                  >
+                    {marker.label}
+                  </text>
+                )}
+              </g>
+            );
+          })}
+
           <g clipPath={`url(#${clipPathId})`}>
             {previousLinePath && <path d={previousLinePath} fill="none" stroke={previousStroke} strokeWidth={2} />}
 
             {currentAreaPath && <path d={currentAreaPath} fill={`url(#${gradientId})`} opacity={currentAreaOpacity} />}
             {currentLinePath && <path d={currentLinePath} fill="none" stroke={currentColor} strokeWidth={2} />}
+
+            {seriesLinePaths.map(item => (
+              <path key={item.id} d={item.path} fill="none" stroke={item.color} strokeWidth={item.strokeWidth ?? 2} />
+            ))}
 
             {dashedAreaPath && (
               <path d={dashedAreaPath} fill={`url(#${dashedGradientId})`} opacity={currentAreaOpacity} />
@@ -648,17 +747,18 @@ export function TimeSeriesChart<
               pointerEvents="none"
             />
           )}
-          {hover && (
+          {hover?.points.map(item => (
             <circle
-              cx={xScale(hover.point.x)}
-              cy={yScale(hover.point.y)}
+              key={item.id}
+              cx={xScale(item.point.x)}
+              cy={yScale(item.point.y)}
               r={4}
-              fill={currentColor}
+              fill={item.color}
               stroke={isDark ? "hsl(var(--neutral-900))" : "white"}
               strokeWidth={2}
               pointerEvents="none"
             />
-          )}
+          ))}
 
           {dragSnapped && dragRaw?.moved && (
             <g pointerEvents="none">
@@ -722,6 +822,7 @@ export function TimeSeriesChart<
             {renderTooltip({
               point: hover.point,
               previousPoint: hover.previousPoint,
+              points: hover.points,
               bucket,
             })}
           </div>,
