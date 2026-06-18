@@ -1,0 +1,91 @@
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ..:/workspace/analytics:cached
+    environment:
+      - NODE_ENV=development
+      - CLICKHOUSE_HOST=http://clickhouse:8123
+      - CLICKHOUSE_DB=analytics
+      - CLICKHOUSE_PASSWORD=frog
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=analytics
+      - POSTGRES_USER=frog
+      - POSTGRES_PASSWORD=frog
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=changeme
+      - BETTER_AUTH_SECRET=a-very-secret-key-for-development
+      - BASE_URL=http://localhost:3002
+    # Overrides default command so container doesn't exit
+    command: sleep infinity
+    depends_on:
+      - postgres
+      - clickhouse
+      - redis
+
+  postgres:
+    image: postgres:17.4
+    environment:
+      - POSTGRES_USER=frog
+      - POSTGRES_PASSWORD=frog
+      - POSTGRES_DB=analytics
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U frog -d analytics"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.4.2
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    configs:
+      - source: clickhouse_network
+        target: /etc/clickhouse-server/config.d/network.xml
+      - source: clickhouse_json
+        target: /etc/clickhouse-server/config.d/enable_json.xml
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    command:
+      - redis-server
+      - --requirepass
+      - changeme
+      - --appendonly
+      - "yes"
+      - --maxmemory-policy
+      - noeviction
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "changeme", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres-data:
+  clickhouse-data:
+
+configs:
+  clickhouse_network:
+    content: |
+      <clickhouse>
+          <listen_host>0.0.0.0</listen_host>
+      </clickhouse>
+  clickhouse_json:
+    content: |
+      <clickhouse>
+          <settings>
+              <enable_json_type>1</enable_json_type>
+          </settings>
+      </clickhouse>
