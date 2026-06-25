@@ -5,6 +5,11 @@
   "root": true,
   "pages": [
     "getting-started",
+    "---Guides---",
+    "weekly-report",
+    "funnel-dropoff",
+    "channel-performance",
+    "live-feed",
     "---Endpoints---",
     "sending-events",
     "overview",
